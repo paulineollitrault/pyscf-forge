@@ -12,6 +12,22 @@ from pyscf import __config__
 
 MINAO = getattr(__config__, 'lo_iao_minao', 'minao')
 
+def _detect_wrap_around(cell, kpts, kmesh=None):
+    """Detect whether kpts were generated with wrap_around=True.
+
+    FFTISDF (and PySCF) can generate different k-point lists for odd meshes
+    depending on the wrap_around convention. The supercell phase factors must
+    use the same convention to ensure consistent k<->supercell transforms.
+    """
+    kpts = np.asarray(kpts)
+    if kmesh is None:
+        kmesh = k2gamma.kpts_to_kmesh(cell, kpts - kpts[0])
+    # If kpts matches the wrap_around=True list, treat it as wrap_around
+    try:
+        return np.allclose(kpts, cell.get_kpts(kmesh, wrap_around=True))
+    except Exception:
+        return False
+
 
 def k2s_scf(kmf, fock_imag_tol=1e-6):
     from pyscf.scf.hf import eig
@@ -23,7 +39,8 @@ def k2s_scf(kmf, fock_imag_tol=1e-6):
     assert( abs((Nk**(1./3.))**3.-Nk) < 0.1 )
 
     kmesh = k2gamma.kpts_to_kmesh(cell, kpts-kpts[0])
-    scell, phase = k2gamma.get_phase(cell, kpts, kmesh)
+    wrap_around = _detect_wrap_around(cell, kpts, kmesh)
+    scell, phase = k2gamma.get_phase(cell, kpts, kmesh, wrap_around=wrap_around)
 
     kmo_coeff = kmf.mo_coeff
     kmo_energy = kmf.mo_energy
@@ -118,7 +135,8 @@ def s2k_mo_coeff(cell, kpts, mo_coeff):
     assert(Nk*nao == Nao)
 
     kmesh = k2gamma.kpts_to_kmesh(cell, kpts-kpts[0])
-    scell, phase = k2gamma.get_phase(cell, kpts, kmesh)
+    wrap_around = _detect_wrap_around(cell, kpts, kmesh)
+    scell, phase = k2gamma.get_phase(cell, kpts, kmesh, wrap_around=wrap_around)
 
     kmo_coeff = lib.einsum('Rk,Rpi->kpi', phase.conj(), mo_coeff.reshape(Nk,nao,Nmo))
     return kmo_coeff
@@ -129,7 +147,8 @@ def k2s_aoint(cell, kpts, kA, name='aoint', phase=None):
     '''
     if phase is None:
         kmesh = k2gamma.kpts_to_kmesh(cell, kpts-kpts[0])
-        scell, phase = k2gamma.get_phase(cell, kpts, kmesh)
+        wrap_around = _detect_wrap_around(cell, kpts, kmesh)
+        scell, phase = k2gamma.get_phase(cell, kpts, kmesh, wrap_around=wrap_around)
     return _k2s_aoint(kA, kpts, phase)
 
 def _k2s_aoint(kA, kpts, phase, name='aoint'):
@@ -158,9 +177,32 @@ class K2SDF(lib.StreamObject):
         self.qpts = self.kpts - self.kpts[0]
 
         self.kikj_by_q = get_kikj_by_q(self.cell, self.kpts, self.qpts)
+        is_isdf = (not hasattr(with_df, '_cderi')) and hasattr(with_df, 'coul_kpt')
+        # For non-GDF ISDF-like backends, the Coulomb metric blocks are naturally
+        # indexed by with_df.kconserv2[ki,kj] (an index into the k-point list).
+        # The geometric get_kikj_by_q grouping can mix multiple such indices in one
+        # q-bucket on some meshes (notably odd meshes / BZ-boundary ambiguity).
+        #
+        # Regroup (ki,kj) pairs by kconserv2 so each q bucket corresponds to one
+        # Coulomb block index.
+        if (not hasattr(with_df, '_cderi')) and hasattr(with_df, 'coul_kpt') and hasattr(with_df, 'kconserv2'):
+            nk = len(self.kpts)
+            kikj = [[] for _ in range(nk)]
+            kconserv2 = np.asarray(with_df.kconserv2)
+            for ki in range(nk):
+                for kj in range(nk):
+                    qk = int(kconserv2[ki, kj])
+                    kikj[qk].append((ki, kj))
+            self.kikj_by_q = [np.asarray(pairs, dtype=int) for pairs in kikj]
         self.qconserv = get_qconserv(self.cell, self.qpts)
 
         nqpts = len(self.qpts)
+        # NOTE: For ISDF-like backends, even if we construct DF-like factors L(q)=A(q)rho(q),
+        # the square-root gauge A(q) is not guaranteed to satisfy the time-reversal relation
+        # required by the IBZ/TRS reduction logic below. To avoid mis-weighting q/-q pairs,
+        # disable the reduction for ISDF and use the full q-point set.
+        if is_isdf:
+            time_reversal_symmetry = False
         if gamma_point(self.kpts[0]) and time_reversal_symmetry:    # time reversal symmetry
             find = np.zeros(len(self.qpts), dtype=bool)
             ibz2bz = []
@@ -179,10 +221,13 @@ class K2SDF(lib.StreamObject):
             self.qpts_ibz_weights = np.ones(nqpts) / nqpts**0.5
 
         self.kmesh = k2gamma.kpts_to_kmesh(self.cell, self.qpts)
-        self.scell, self.phase = k2gamma.get_phase(self.cell, self.kpts, self.kmesh)
+        wrap_around = _detect_wrap_around(self.cell, self.kpts, self.kmesh)
+        self.scell, self.phase = k2gamma.get_phase(self.cell, self.kpts, self.kmesh, wrap_around=wrap_around)
 
         self._naux = None
         self.blockdim = with_df.blockdim
+        # Cache for non-GDF (ISDF-like) backends
+        self._isdf_coul_by_q = {}
 
     @property
     def naux_by_q(self):
@@ -202,11 +247,24 @@ class K2SDF(lib.StreamObject):
             kpts = self.kpts
             nqpts = len(self.qpts)
             naux = np.zeros(nqpts, dtype=int)
-            for q in range(nqpts):
-                ki,kj = self.kikj_by_q[q][0]
-                kpti_kptj = np.asarray((kpts[ki],kpts[kj]))
-                with _load3c(with_df._cderi, with_df._dataname, kpti_kptj=kpti_kptj) as j3c:
-                    naux[q] = j3c.shape[0]
+            if hasattr(with_df, '_cderi'):
+                for q in range(nqpts):
+                    ki,kj = self.kikj_by_q[q][0]
+                    kpti_kptj = np.asarray((kpts[ki],kpts[kj]))
+                    with _load3c(with_df._cderi, with_df._dataname, kpti_kptj=kpti_kptj) as j3c:
+                        naux[q] = j3c.shape[0]
+            else:
+                # Support non-GDF DF backends (e.g. FFT-ISDF) that do not store 3c integrals.
+                #
+                # For ISDF-like backends, treat the interpolation-point dimension as the
+                # "aux" dimension. This enables the KLNO codepath to size its buffers.
+                if not hasattr(with_df, 'inpv_kpt'):
+                    raise AttributeError(
+                        "DF backend does not provide '_cderi' (GDF-style) nor 'inpv_kpt' "
+                        "(ISDF-style). Cannot determine auxiliary dimension."
+                    )
+                nip = int(with_df.inpv_kpt.shape[1])
+                naux[:] = nip
             self._naux = naux
         return self._naux
 
@@ -227,6 +285,11 @@ class K2SDF(lib.StreamObject):
         p0,p1 = auxslice
         with_df = self.with_df
         kpts = self.kpts
+        if not hasattr(with_df, '_cderi'):
+            raise NotImplementedError(
+                "K2SDF.loop is only available for GDF-like backends with '_cderi'. "
+                "Use K2SDF.loop_ao2mo for non-GDF (e.g. ISDF) backends."
+            )
         for ki,kj in self.kikj_by_q[q]:
             kpti_kptj = np.asarray((kpts[ki],kpts[kj]))
             with _load3c(with_df._cderi, with_df._dataname, kpti_kptj=kpti_kptj) as j3c:
@@ -235,6 +298,10 @@ class K2SDF(lib.StreamObject):
     def loop_ao2mo(self, q, mo1, mo2, buf=None, real_and_imag=False, auxslice=None):
         ''' Loop over all Lpq[k1,k2] s.t. kpts[k] = -kpts[k1] + kpts[k2]
         '''
+        with_df = self.with_df
+        if not hasattr(with_df, '_cderi'):
+            yield from self._loop_ao2mo_isdf(q, mo1, mo2, real_and_imag=real_and_imag, auxslice=auxslice)
+            return
         kmo1 = self.s2k_mo_coeff(mo1)
         kmo2 = self.s2k_mo_coeff(mo2)
         tao = []
@@ -253,6 +320,137 @@ class K2SDF(lib.StreamObject):
             else:
                 yield (ki,kj), Lpq
             Lpq_ao = Lpq = None
+
+    def _loop_ao2mo_isdf(self, q, mo1, mo2, real_and_imag=False, auxslice=None):
+        """Non-GDF (ISDF-like) backend: yield q-resolved ISDF pair-density factors.
+
+        We return (conjugated) q-resolved pair densities on interpolation points,
+        matching FFTISDF's definition of rho_q:
+
+            L(q) := rho_q^*
+
+        so that downstream code can form ERIs by applying the ISDF Coulomb metric C(q)
+        explicitly:
+
+            (12|34) = Re[ rho12_q^T C(q) rho34_q^* ]
+                    = Re[ L12_q^H  C(q)  L34_q ].
+        """
+        with_df = self.with_df
+        if not (hasattr(with_df, 'inpv_kpt') and hasattr(with_df, 'coul_kpt')):
+            raise AttributeError(
+                "Non-GDF DF backend must provide 'inpv_kpt' and 'coul_kpt' to support KLNO."
+            )
+
+        inpv_kpt = np.asarray(with_df.inpv_kpt)  # (nkpts, nip, nao)
+        nip = int(inpv_kpt.shape[1])
+
+        if auxslice is None:
+            auxslice = (0, nip)
+        p0, p1 = auxslice
+        dp = int(p1 - p0)
+
+        kmo1 = self.s2k_mo_coeff(mo1)
+        kmo2 = self.s2k_mo_coeff(mo2)
+
+        nk = len(self.kpts)
+        nspc = int(self.phase.shape[0])
+        wR = np.asarray(self.phase[:, q].conj(), order='C')  # (nspc,)
+
+        # Build orbital values on interpolation points in k-space:
+        # x1_kpt[k] = inpv_kpt[k] @ kmo1[k]
+        # x2_kpt[k] = inpv_kpt[k] @ kmo2[k]
+        nmo1 = kmo1[0].shape[1]
+        nmo2 = kmo2[0].shape[1]
+        x1_kpt = np.empty((nk, nip, nmo1), dtype=np.complex128)
+        x2_kpt = np.empty((nk, nip, nmo2), dtype=np.complex128)
+        for k in range(nk):
+            x1_kpt[k] = lib.dot(inpv_kpt[k], np.asarray(kmo1[k], order='F'))
+            x2_kpt[k] = lib.dot(inpv_kpt[k], np.asarray(kmo2[k], order='F'))
+
+        # k -> stripe (supercell) transform using the same phase convention as k2gamma
+        # phase has shape (nspc, nk) and already includes 1/sqrt(nspc) normalization.
+        # Match FFTISDF's stripe transform: kpt_to_spc returns real part
+        x1_spc = lib.dot(self.phase, x1_kpt.reshape(nk, -1)).reshape(nspc, nip, nmo1).real
+        x2_spc = lib.dot(self.phase, x2_kpt.reshape(nk, -1)).reshape(nspc, nip, nmo2).real
+
+        # Construct rho_q via stripe products and spc -> k transform:
+        # rho_q[I,i,a] = sum_R phase[R,q]^* * x1_spc[R,I,i]^* * x2_spc[R,I,a]
+        ncol = nmo1 * nmo2
+        out = np.empty((dp, ncol), dtype=np.complex128)
+        for t, I in enumerate(range(p0, p1)):
+            tmp = x2_spc[:, I, :] * wR[:, None]                 # (nspc, nmo2)
+            rhoI = lib.dot(x1_spc[:, I, :].T, tmp)              # (nmo1, nmo2)
+            out[t] = rhoI.reshape(-1)
+        # Return L = rho^*
+        out = out.conj()
+        # Normalization:
+        # KLNO's DF pipeline (GDF) uses the q-point weights `w` in `_init_mp_df_eris_real`
+        # to build ovL with the correct normalization for MP2/CCSD energies.
+        #
+        # The raw stripe-based construction here produces factors that are smaller
+        # than the GDF convention by ~1/sqrt(nspc). Scale by sqrt(nspc) so that
+        # Re[L^H C L] matches the GDF-normalized ERIs (and thus MP2/CCSD energies).
+        out *= np.sqrt(nspc)
+
+        # Yield a single aggregate (ki,kj) block for this q.
+        # The KLNO builders sum over (ki,kj) pairs; we have already performed that
+        # sum by constructing rho_q through the stripe round-trip.
+        ki0, kj0 = self.kikj_by_q[q][0]
+        if real_and_imag:
+            yield (int(ki0), int(kj0)), np.asarray(out.real).reshape(-1), np.asarray(out.imag).reshape(-1)
+        else:
+            yield (int(ki0), int(kj0)), out.reshape(-1)
+        x1_kpt = x2_kpt = x1_spc = x2_spc = out = None
+
+    def get_isdf_coul(self, q):
+        """Return ISDF Coulomb metric block for q (cached).
+
+        FFT-ISDF constructs the metric as Hermitian (C = C^H). We keep that
+        convention here. Do NOT symmetrize with transpose (C^T) because for
+        Hermitian complex C it effectively projects to Re(C).
+        """
+        if q in self._isdf_coul_by_q:
+            return self._isdf_coul_by_q[q]
+        with_df = self.with_df
+        if not hasattr(with_df, 'coul_kpt'):
+            raise AttributeError("DF backend does not provide 'coul_kpt'")
+        kikj_list = self.kikj_by_q[q]
+        if len(kikj_list) == 0:
+            raise RuntimeError(f"No (ki,kj) pairs found for q={q}")
+        if hasattr(with_df, 'kconserv2'):
+            ki0, kj0 = kikj_list[0]
+            qk = int(with_df.kconserv2[ki0, kj0])
+        else:
+            qk = q
+        C = np.asarray(with_df.coul_kpt[qk])
+        C = (C + C.conj().T) * 0.5
+        self._isdf_coul_by_q[q] = C
+        return C
+
+    def apply_isdf_coul(self, XR, XI):
+        """Apply block-diagonal ISDF Coulomb metric to stacked aux tensors.
+
+        XR, XI have shape (Naux_ibz, ncol) where Naux_ibz = naux * len(qpts_ibz).
+        Returns (YR, YI) with same shapes.
+        """
+        XR = np.asarray(XR)
+        XI = np.asarray(XI)
+        YR = np.empty_like(XR)
+        YI = np.empty_like(XI)
+        naux_stride = int(self.naux)
+        naux_by_q = self.naux_by_q
+        for qi, q in enumerate(self.ibz2bz):
+            nauxq = int(naux_by_q[q])
+            p0 = naux_stride * qi
+            p1 = p0 + nauxq
+            C = self.get_isdf_coul(q)
+            CR = C.real
+            CI = C.imag
+            xr = XR[p0:p1]
+            xi = XI[p0:p1]
+            YR[p0:p1] = CR.dot(xr) - CI.dot(xi)
+            YI[p0:p1] = CR.dot(xi) + CI.dot(xr)
+        return YR, YI
 
     def get_eri_dtype_dsize(self, *arrs):
         ''' Get ERI dtype/size given arrays involved (e.g., mo_coeff).

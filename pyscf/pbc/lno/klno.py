@@ -102,7 +102,10 @@ class KLNO(LNO):
             mem_now = self.max_memory - lib.current_memory()[0]
             nkpts = len(self.kpts)
             naux = self.with_df.get_naoaux()
-            nk = nkpts//2+nkpts%2 if gamma_point(self.kpts[0]) and np.isrealobj(orbocc) else nkpts
+            # For ISDF-like backends, K2SDF disables the TRS/IBZ reduction (see tools.K2SDF)
+            # so the aux dimension effectively scales with the full k-point set.
+            is_isdf = (not hasattr(self.with_df, '_cderi')) and hasattr(self.with_df, 'coul_kpt')
+            nk = nkpts if is_isdf else (nkpts//2+nkpts%2 if gamma_point(self.kpts[0]) and np.isrealobj(orbocc) else nkpts)
             mem_df = nk*nocc*nvir*naux*dsize/1024**2.
             log.debug('ao2mo est mem= %.2f MB  avail mem= %.2f MB', mem_df, mem_now)
             if ( (self._ovL_to_save is not None) or (self._ovL is not None) or

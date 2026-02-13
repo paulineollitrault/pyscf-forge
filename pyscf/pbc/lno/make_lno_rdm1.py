@@ -29,6 +29,22 @@ from pyscf.pbc.lno.tools import zdotCNtoR
 
 DEBUG_BLKSIZE = getattr(__config__, 'lno_base_make_rdm1_k2s_DEBUG_BLKSIZE', False)
 
+def _is_isdf_eris(eris):
+    with_df = getattr(eris, 'with_df', None)
+    return (with_df is not None and (not hasattr(with_df, '_cderi')) and hasattr(with_df, 'coul_kpt'))
+
+def _dot_ovlp(eris, aR, aI, bR, bI, out):
+    """Compute Re[a^H * (metric-applied b)].
+
+    DF backends: metric is identity in this representation.
+    ISDF backends: apply Coulomb metric blocks C(q) to b.
+    """
+    if _is_isdf_eris(eris):
+        bR2, bI2 = eris.apply_isdf_coul(bR, bI)
+        return zdotCNtoR(aR, aI, bR2, bI2, cR=out)
+    else:
+        return zdotCNtoR(aR, aI, bR, bI, cR=out)
+
 
 def make_lo_rdm1_occ(eris, moeocc, moevir, uocc, uvir, dm_type):
     isreal = eris.dtype == np.float64
@@ -121,7 +137,7 @@ def make_full_rdm1(eris, moeocc, moevir, with_occ=True, with_vir=True):
                 ejv = eov[j0:j1]
             denom = lib.direct_sum('ia+jb->iajb', eiv, ejv)
             t2ijvv = np.ndarray((ivLR.shape[0],jvLR.shape[0]), dtype=REAL, buffer=buf)
-            zdotCNtoR(ivLR, ivLI, jvLR.T, jvLI.T, cR=t2ijvv)
+            _dot_ovlp(eris, ivLR, ivLI, jvLR.T, jvLI.T, t2ijvv)
             t2ijvv = t2ijvv.reshape(*denom.shape)
             t2ijvv /= denom
             jvLR = jvLI = None
@@ -173,7 +189,6 @@ def make_lo_rdm1_occ_1h_real(eris, moeocc, moevir, u):
     moeOcc, u = subspace_eigh(np.diag(moeocc), u)
     eov = moeocc[:,None] - moevir
     eOv = moeOcc[:,None] - moevir
-
     dm = np.zeros((nocc,nocc), dtype=REAL)
     for Kbatch,(K0,K1) in enumerate(lib.prange(0,nOcc,occblksize)):
         KvLR, KvLI = eris.xform_occ(u[:,K0:K1])
@@ -187,7 +202,7 @@ def make_lo_rdm1_occ_1h_real(eris, moeocc, moevir, u):
             ivLR = ivLR.reshape(-1,naux)
             ivLI = ivLI.reshape(-1,naux)
             t2ivKv = np.ndarray((ivLR.shape[0],KvLR.shape[0]), dtype=REAL, buffer=buf1)
-            zdotCNtoR(ivLR, ivLI, KvLR.T, KvLI.T, cR=t2ivKv)
+            _dot_ovlp(eris, ivLR, ivLI, KvLR.T, KvLI.T, t2ivKv)
             t2ivKv = t2ivKv.reshape(*eivKv.shape)
             t2ivKv /= eivKv
             ivLR = ivLI = None
@@ -202,7 +217,7 @@ def make_lo_rdm1_occ_1h_real(eris, moeocc, moevir, u):
                     jvLR = jvLR.reshape(-1,naux)
                     jvLI = jvLI.reshape(-1,naux)
                     t2jvKv = np.ndarray((jvLR.shape[0],KvLR.shape[0]), dtype=REAL, buffer=buf2)
-                    zdotCNtoR(jvLR, jvLI, KvLR.T, KvLI.T, cR=t2jvKv)
+                    _dot_ovlp(eris, jvLR, jvLI, KvLR.T, KvLI.T, t2jvKv)
                     t2jvKv = t2jvKv.reshape(*ejvKv.shape)
                     t2jvKv /= ejvKv
                     jvLR = jvLI = None
@@ -267,7 +282,7 @@ def make_lo_rdm1_occ_1p_real(eris, moeocc, moevir, u):
             obLR = obLR.reshape(-1,naux)
             obLI = obLI.reshape(-1,naux)
             t2oAob = np.ndarray((oALR.shape[0],obLR.shape[0]), dtype=REAL, buffer=buf)
-            zdotCNtoR(oALR, oALI, obLR.T, obLI.T, cR=t2oAob)
+            _dot_ovlp(eris, oALR, oALI, obLR.T, obLI.T, t2oAob)
             t2oAob = t2oAob.reshape(*eoAob.shape)
             t2oAob /= eoAob
             eoAob = None
@@ -337,7 +352,7 @@ def make_lo_rdm1_occ_2p_real(eris, moeocc, moevir, u):
 
             eoAoB = lib.direct_sum('iA+jB->iAjB', eoA, eoB)
             t2oAoB = np.ndarray((oALR.shape[0], oBLR.shape[0]), dtype=REAL, buffer=buf)
-            zdotCNtoR(oALR, oALI, oBLR.T, oBLI.T, cR=t2oAoB)
+            _dot_ovlp(eris, oALR, oALI, oBLR.T, oBLI.T, t2oAoB)
             t2oAoB = t2oAoB.reshape(*eoAoB.shape)
             t2oAoB /= eoAoB
             eoAoB = None
@@ -402,7 +417,7 @@ def make_lo_rdm1_vir_1p_real(eris, moeocc, moevir, u):
             oaLR = oaLR.reshape(-1,naux)
             oaLI = oaLI.reshape(-1,naux)
             t2oAoa = np.ndarray((oALR.shape[0], oaLR.shape[0]), dtype=REAL, buffer=buf1)
-            zdotCNtoR(oALR, oALI, oaLR.T, oaLI.T, cR=t2oAoa)
+            _dot_ovlp(eris, oALR, oALI, oaLR.T, oaLI.T, t2oAoa)
             t2oAoa = t2oAoa.reshape(*eoAoa.shape)
             t2oAoa /= eoAoa
             eoAoa = None
@@ -417,7 +432,7 @@ def make_lo_rdm1_vir_1p_real(eris, moeocc, moevir, u):
                     obLR = obLR.reshape(-1,naux)
                     obLI = obLI.reshape(-1,naux)
                     t2oAob = np.ndarray((oALR.shape[0], obLR.shape[0]), dtype=REAL, buffer=buf2)
-                    zdotCNtoR(oALR, oALI, obLR.T, obLI.T, cR=t2oAob)
+                    _dot_ovlp(eris, oALR, oALI, obLR.T, obLI.T, t2oAob)
                     t2oAob = t2oAob.reshape(*eoAob.shape)
                     t2oAob /= eoAob
                     eoAob = None
@@ -482,7 +497,7 @@ def make_lo_rdm1_vir_1h_real(eris, moeocc, moevir, u):
             jvLR = jvLR.reshape(-1,naux)
             jvLI = jvLI.reshape(-1,naux)
             t2Ivjv = np.ndarray((IvLR.shape[0], jvLR.shape[0]), dtype=REAL, buffer=buf)
-            zdotCNtoR(IvLR, IvLI, jvLR.T, jvLI.T, cR=t2Ivjv)
+            _dot_ovlp(eris, IvLR, IvLI, jvLR.T, jvLI.T, t2Ivjv)
             t2Ivjv = t2Ivjv.reshape(*eIvjv.shape)
             t2Ivjv /= eIvjv
             eIvjv = None
@@ -552,7 +567,7 @@ def make_lo_rdm1_vir_2h_real(eris, moeocc, moevir, u):
 
             eIvJv = lib.direct_sum('Ia+Jb->IaJb', eIv, eJv)
             t2IvJv = np.ndarray((IvLR.shape[0], JvLR.shape[0]), dtype=REAL, buffer=buf)
-            zdotCNtoR(IvLR, IvLI, JvLR.T, JvLI.T, cR=t2IvJv)
+            _dot_ovlp(eris, IvLR, IvLI, JvLR.T, JvLI.T, t2IvJv)
             t2IvJv = t2IvJv.reshape(*eIvJv.shape)
             t2IvJv /= eIvJv
             eIvJv = None

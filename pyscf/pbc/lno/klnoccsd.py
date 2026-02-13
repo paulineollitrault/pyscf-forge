@@ -85,6 +85,7 @@ def K2SCCSD(mf, with_df, frozen, mo_coeff, mo_occ):
     '''
     k2sdf = K2SDF(with_df)
     naux = k2sdf.Naux_ibz
+    is_isdf = (not hasattr(with_df, '_cderi')) and hasattr(with_df, 'coul_kpt')
     maskocc = mo_occ > 1e-10
     frozen, maskact = get_maskact(frozen, len(mo_occ))
     nvir = np.count_nonzero(~maskocc & maskact)
@@ -97,6 +98,12 @@ def K2SCCSD(mf, with_df, frozen, mo_coeff, mo_occ):
     if gamma_point(with_df.kpts[0]) and np.isrealobj(mo_coeff):
         ''' Gamma-inclusive k-point mesh and time-reversal symmetry conserved
         '''
+        if is_isdf:
+            # For ISDF we store raw rho* factors in ovL and must apply C(q) explicitly
+            # when contracting. The DFCCSD path assumes metric-factored vvL and would
+            # require additional ISDF-specific branching in multiple hot spots.
+            log.debug1('ISDF backend detected; forcing CCSD (store vvvv)')
+            return MODIFIED_K2SCCSD(mf, with_df, frozen, mo_coeff, mo_occ)
         if not FORCE_DFKCC and (naux > nvir_pair or mem_need < mem_avail * 0.7):
             log.debug1('Using CCSD')
             return MODIFIED_K2SCCSD(mf, with_df, frozen, mo_coeff, mo_occ)
@@ -197,14 +204,32 @@ def _make_df_eris_outcore(mycc, mo_coeff=None):
                                            chunks=(nocc,1,nocc,nvir))
     eris.ovvv = eris.feri1.create_dataset('ovvv', (nocc,nvir,nvir_pair), 'f8')
     eris.vvvv = eris.feri1.create_dataset('vvvv', (nvir_pair,nvir_pair), 'f8')
-    eris.oooo[:] = zdotCNtoR(LooR.T, LooI.T, LooR, LooI).reshape(nocc,nocc,nocc,nocc)
-    eris.ovoo[:] = zdotCNtoR(LovR.T, LovI.T, LooR, LooI).reshape(nocc,nvir,nocc,nocc)
-    eris.oovv[:] = lib.unpack_tril(zdotCNtoR(LooR.T, LooI.T,
-                                             LvvR  , LvvI)).reshape(nocc,nocc,nvir,nvir)
-    eris.ovvo[:] = zdotCNtoR(LovR.T, LovI.T, LvoR, LvoI).reshape(nocc,nvir,nvir,nocc)
-    eris.ovov[:] = zdotCNtoR(LovR.T, LovI.T, LovR, LovI).reshape(nocc,nvir,nocc,nvir)
-    eris.ovvv[:] = zdotCNtoR(LovR.T, LovI.T, LvvR, LvvI).reshape(nocc,nvir,nvir_pair)
-    eris.vvvv[:] = zdotCNtoR(LvvR.T, LvvI.T, LvvR, LvvI)
+    with_df = getattr(k2sdf, 'with_df', None)
+    is_isdf = (with_df is not None and (not hasattr(with_df, '_cderi')) and hasattr(with_df, 'coul_kpt'))
+    if is_isdf:
+        # ISDF ERIs: Re[L12^H C L34] where L = rho*
+        LooR2, LooI2 = k2sdf.apply_isdf_coul(LooR, LooI)
+        LovR2, LovI2 = k2sdf.apply_isdf_coul(LovR, LovI)
+        LvoR2, LvoI2 = k2sdf.apply_isdf_coul(LvoR, LvoI)
+        LvvR2, LvvI2 = k2sdf.apply_isdf_coul(LvvR, LvvI)
+        eris.oooo[:] = zdotCNtoR(LooR.T, LooI.T, LooR2, LooI2).reshape(nocc,nocc,nocc,nocc)
+        eris.ovoo[:] = zdotCNtoR(LovR.T, LovI.T, LooR2, LooI2).reshape(nocc,nvir,nocc,nocc)
+        eris.oovv[:] = lib.unpack_tril(zdotCNtoR(LooR.T, LooI.T,
+                                                 LvvR2  , LvvI2)).reshape(nocc,nocc,nvir,nvir)
+        eris.ovvo[:] = zdotCNtoR(LovR.T, LovI.T, LvoR2, LvoI2).reshape(nocc,nvir,nvir,nocc)
+        eris.ovov[:] = zdotCNtoR(LovR.T, LovI.T, LovR2, LovI2).reshape(nocc,nvir,nocc,nvir)
+        eris.ovvv[:] = zdotCNtoR(LovR.T, LovI.T, LvvR2, LvvI2).reshape(nocc,nvir,nvir_pair)
+        eris.vvvv[:] = zdotCNtoR(LvvR.T, LvvI.T, LvvR2, LvvI2)
+        LooR2 = LooI2 = LovR2 = LovI2 = LvoR2 = LvoI2 = LvvR2 = LvvI2 = None
+    else:
+        eris.oooo[:] = zdotCNtoR(LooR.T, LooI.T, LooR, LooI).reshape(nocc,nocc,nocc,nocc)
+        eris.ovoo[:] = zdotCNtoR(LovR.T, LovI.T, LooR, LooI).reshape(nocc,nvir,nocc,nocc)
+        eris.oovv[:] = lib.unpack_tril(zdotCNtoR(LooR.T, LooI.T,
+                                                 LvvR  , LvvI)).reshape(nocc,nocc,nvir,nvir)
+        eris.ovvo[:] = zdotCNtoR(LovR.T, LovI.T, LvoR, LvoI).reshape(nocc,nvir,nvir,nocc)
+        eris.ovov[:] = zdotCNtoR(LovR.T, LovI.T, LovR, LovI).reshape(nocc,nvir,nocc,nvir)
+        eris.ovvv[:] = zdotCNtoR(LovR.T, LovI.T, LvvR, LvvI).reshape(nocc,nvir,nvir_pair)
+        eris.vvvv[:] = zdotCNtoR(LvvR.T, LvvI.T, LvvR, LvvI)
 
     log.timer('CCSD integral transformation', *cput0)
     return eris
@@ -279,7 +304,14 @@ def _contract_vvvv_t2(mycc, mol, vvLR, vvLI, t2, out=None, verbose=None):
             for p0, p1 in lib.prange(0, nvir_pair, vvblk):
                 vvLR1 = _cp(vvLR[p0:p1])
                 vvLI1 = _cp(vvLI[p0:p1])
-                eri[:,p0:p1] = zdotCNtoR(ijLR, ijLI, vvLR1.T, vvLI1.T)
+                with_df = getattr(getattr(mycc, 'k2sdf', None), 'with_df', None)
+                is_isdf = (with_df is not None and (not hasattr(with_df, '_cderi')) and hasattr(with_df, 'coul_kpt'))
+                if is_isdf:
+                    vvLR2, vvLI2 = mycc.k2sdf.apply_isdf_coul(vvLR1.T, vvLI1.T)
+                    eri[:,p0:p1] = zdotCNtoR(ijLR, ijLI, vvLR2, vvLI2)
+                    vvLR2 = vvLI2 = None
+                else:
+                    eri[:,p0:p1] = zdotCNtoR(ijLR, ijLI, vvLR1.T, vvLI1.T)
                 vvLR1 = vvLI1 = None
             ijLR = ijLI = None
 
