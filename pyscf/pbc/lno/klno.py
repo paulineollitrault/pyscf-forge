@@ -31,6 +31,7 @@
 
 
 import sys
+import os
 import numpy as np
 import h5py
 
@@ -305,22 +306,26 @@ def _init_mp_df_eris_real(k2sdf, orbocc, orbvir, max_memory, ovLR=None, ovLI=Non
         for p0,p1 in lib.prange(0, nauxq, aux_blksize):
             auxslice = (p0,p1)
             dp = p1 - p0
-            LovR = np.ndarray((dp,nocc,nvir), dtype=REAL, buffer=bufR)
-            LovI = np.ndarray((dp,nocc,nvir), dtype=REAL, buffer=bufI)
+            # Keep LovR/LovI in (nocc,nvir,dp) (C-contiguous) layout so the HDF5
+            # write ovL[:,:,b0:b1] can be done without an extra transpose/copy.
+            LovR = np.ndarray((nocc,nvir,dp), dtype=REAL, buffer=bufR)
+            LovI = np.ndarray((nocc,nvir,dp), dtype=REAL, buffer=bufI)
             LovR.fill(0)
             LovI.fill(0)
             for (ki,kj),LpqR,LpqI in k2sdf.loop_ao2mo(q, orbocc, orbvir, buf=buf,
                                                       real_and_imag=True, auxslice=auxslice):
-                LovR += LpqR.reshape(dp,nocc,nvir)
-                LovI += LpqI.reshape(dp,nocc,nvir)
+                # LpqR/LpqI are returned in (dp,nocc,nvir) order; accumulate into
+                # LovR/LovI's (nocc,nvir,dp) layout.
+                LovR += LpqR.reshape(dp,nocc,nvir).transpose(1,2,0)
+                LovI += LpqI.reshape(dp,nocc,nvir).transpose(1,2,0)
                 LpqR = LpqI = None
             w = k2sdf.qpts_ibz_weights[qi]
             LovR *= w
             LovI *= w
             b0 = naux*qi + p0
             b1 = b0 + dp
-            ovLR[:,:,b0:b1] = LovR.transpose(1,2,0)
-            ovLI[:,:,b0:b1] = LovI.transpose(1,2,0)
+            ovLR[:,:,b0:b1] = LovR
+            ovLI[:,:,b0:b1] = LovI
             LovR = LovI = None
         cput1 = log.timer('ao2mo for qidx %d/%d'%(qi+1,nqpts), *cput1)
 
@@ -424,7 +429,11 @@ class _KLNODFOUTCOREERIS_COMPLEX(_KLNODFINCOREERIS_COMPLEX):
                 self.feri = lib.H5TmpFile()
             log.info('ovL is saved to %s', self.feri.filename)
             shape = (len(self.qpts),self.nocc,self.nvir,self.naux)
-            self.ovL = self.feri.create_dataset('ovL', shape, self.dtype, chunks=(1,*shape[1:]))
+            # NOTE: Use contiguous layout (no chunking) for outcore ovL.
+            # The ao2mo kernel writes large hyperslabs like ovL[q, i0:i1, :, :].
+            # A poorly-matched chunk layout can trigger HDF5 read-modify-write on many
+            # small blocks and severely throttle wall time on network-backed storage.
+            self.ovL = self.feri.create_dataset('ovL', shape, self.dtype)
             _init_mp_df_eris_complex(self, self.orbocc, self.orbvir, self.max_memory,
                                      ovL=self.ovL, log=log)
         elif isinstance(self._ovL, str):

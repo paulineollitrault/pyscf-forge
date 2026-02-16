@@ -1,4 +1,5 @@
 import sys
+import os
 import numpy as np
 from functools import reduce
 
@@ -200,8 +201,16 @@ class K2SDF(lib.StreamObject):
         # NOTE: For ISDF-like backends, even if we construct DF-like factors L(q)=A(q)rho(q),
         # the square-root gauge A(q) is not guaranteed to satisfy the time-reversal relation
         # required by the IBZ/TRS reduction logic below. To avoid mis-weighting q/-q pairs,
-        # disable the reduction for ISDF and use the full q-point set.
-        if is_isdf:
+        # disable the reduction for ISDF and use the full q-point set by default.
+        #
+        # However, in this fork we also support an ISDF path that returns raw pair-density
+        # factors (rho_q^*) without applying a square-root gauge. In that case, the TRS/IBZ
+        # reduction can be enabled explicitly to reduce both compute and outcore I/O.
+        allow_isdf_trsymm = (
+            os.environ.get('PYSCF_LNO_ISDF_TRSYM', '').strip().lower() in ('1', 'true', 'yes', 'on')
+            or getattr(__config__, 'pbc_lno_tools_allow_isdf_trsymm', False)
+        )
+        if is_isdf and not allow_isdf_trsymm:
             time_reversal_symmetry = False
         if gamma_point(self.kpts[0]) and time_reversal_symmetry:    # time reversal symmetry
             find = np.zeros(len(self.qpts), dtype=bool)
@@ -341,7 +350,11 @@ class K2SDF(lib.StreamObject):
                 "Non-GDF DF backend must provide 'inpv_kpt' and 'coul_kpt' to support KLNO."
             )
 
-        inpv_kpt = np.asarray(with_df.inpv_kpt)  # (nkpts, nip, nao)
+        # Note: FFT-ISDF stores interpolation-point AO values in `inpv_kpt` with shape
+        # (nkpts, nip, nao). For modest systems this can be a regular numpy array in memory,
+        # but for production it may be backed by an HDF5 dataset / memmap. Avoid forcing
+        # unnecessary full materialization and avoid building huge intermediate arrays.
+        inpv_kpt = with_df.inpv_kpt  # array-like, (nkpts, nip, nao)
         nip = int(inpv_kpt.shape[1])
 
         if auxslice is None:
@@ -356,40 +369,53 @@ class K2SDF(lib.StreamObject):
         nspc = int(self.phase.shape[0])
         wR = np.asarray(self.phase[:, q].conj(), order='C')  # (nspc,)
 
-        # Build orbital values on interpolation points in k-space:
-        # x1_kpt[k] = inpv_kpt[k] @ kmo1[k]
-        # x2_kpt[k] = inpv_kpt[k] @ kmo2[k]
+        # Build rho_q in blocks of interpolation points to keep peak memory bounded.
+        # This avoids allocating x2_kpt/x2_spc arrays of size (nk, nip, nmo2) which can
+        # become extremely large and trigger paging (appearing as heavy EBS I/O).
         nmo1 = kmo1[0].shape[1]
         nmo2 = kmo2[0].shape[1]
-        x1_kpt = np.empty((nk, nip, nmo1), dtype=np.complex128)
-        x2_kpt = np.empty((nk, nip, nmo2), dtype=np.complex128)
-        for k in range(nk):
-            x1_kpt[k] = lib.dot(inpv_kpt[k], np.asarray(kmo1[k], order='F'))
-            x2_kpt[k] = lib.dot(inpv_kpt[k], np.asarray(kmo2[k], order='F'))
-
-        # k -> stripe (supercell) transform using the same phase convention as k2gamma
-        # phase has shape (nspc, nk) and already includes 1/sqrt(nspc) normalization.
-        # Match FFTISDF's stripe transform: kpt_to_spc returns real part
-        x1_spc = lib.dot(self.phase, x1_kpt.reshape(nk, -1)).reshape(nspc, nip, nmo1).real
-        x2_spc = lib.dot(self.phase, x2_kpt.reshape(nk, -1)).reshape(nspc, nip, nmo2).real
-
-        # Construct rho_q via stripe products and spc -> k transform:
-        # rho_q[I,i,a] = sum_R phase[R,q]^* * x1_spc[R,I,i]^* * x2_spc[R,I,a]
         ncol = nmo1 * nmo2
         out = np.empty((dp, ncol), dtype=np.complex128)
-        for t, I in enumerate(range(p0, p1)):
-            tmp = x2_spc[:, I, :] * wR[:, None]                 # (nspc, nmo2)
-            rhoI = lib.dot(x1_spc[:, I, :].T, tmp)              # (nmo1, nmo2)
-            out[t] = rhoI.reshape(-1)
+
+        # Heuristic block size: keep temporary arrays to O(10-100) MB.
+        # For typical KLNO use, nmo2 (vir) dominates.
+        blk = 16
+        if nmo2 >= 2000:
+            blk = 8
+        if dp < blk:
+            blk = dp
+
+        for I0 in range(p0, p1, blk):
+            I1 = min(p1, I0 + blk)
+            bi = I1 - I0
+
+            x1_kpt = np.empty((nk, bi, nmo1), dtype=np.complex128)
+            x2_kpt = np.empty((nk, bi, nmo2), dtype=np.complex128)
+            for k in range(nk):
+                # inpv_kpt[k, I0:I1] is (bi, nao)
+                x1_kpt[k] = lib.dot(np.asarray(inpv_kpt[k, I0:I1], order='C'),
+                                    np.asarray(kmo1[k], order='F'))
+                x2_kpt[k] = lib.dot(np.asarray(inpv_kpt[k, I0:I1], order='C'),
+                                    np.asarray(kmo2[k], order='F'))
+
+            # k -> stripe (supercell) transform.
+            # Match FFTISDF's stripe transform convention: take real part after transform.
+            x1_spc = lib.dot(self.phase, x1_kpt.reshape(nk, -1)).reshape(nspc, bi, nmo1).real
+            x2_spc = lib.dot(self.phase, x2_kpt.reshape(nk, -1)).reshape(nspc, bi, nmo2).real
+
+            # rho_q[I] = x1_spc[:,I]^T @ (x2_spc[:,I] * wR)
+            for t in range(bi):
+                tmp = x2_spc[:, t, :] * wR[:, None]        # (nspc, nmo2)
+                rhoI = lib.dot(x1_spc[:, t, :].T, tmp)     # (nmo1, nmo2)
+                out[I0 - p0 + t] = rhoI.reshape(-1)
+
         # Return L = rho^*
         out = out.conj()
+
         # Normalization:
-        # KLNO's DF pipeline (GDF) uses the q-point weights `w` in `_init_mp_df_eris_real`
-        # to build ovL with the correct normalization for MP2/CCSD energies.
-        #
-        # The raw stripe-based construction here produces factors that are smaller
-        # than the GDF convention by ~1/sqrt(nspc). Scale by sqrt(nspc) so that
-        # Re[L^H C L] matches the GDF-normalized ERIs (and thus MP2/CCSD energies).
+        # The stripe-based construction produces factors that are smaller than the
+        # GDF convention by ~1/sqrt(nspc). Scale by sqrt(nspc) so that downstream
+        # contractions match the GDF-normalized ERIs/energies.
         out *= np.sqrt(nspc)
 
         # Yield a single aggregate (ki,kj) block for this q.

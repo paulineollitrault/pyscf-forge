@@ -657,8 +657,11 @@ class _LNODFOUTCOREERIS(_LNODFINCOREERIS):
             else:
                 self.feri = lib.H5TmpFile()
             log.info('ovL is saved to %s', self.feri.filename)
-            self.ovL = self.feri.create_dataset('ovL', ovL_shape, dtype=self.dtype,
-                                                chunks=(1,*ovL_shape[1:]))
+            # NOTE: Use contiguous layout (no chunking) for outcore ovL.
+            # The DF ao2mo code writes large hyperslabs (ovL[i0:i1] blocks).
+            # Chunking with an ill-suited chunk shape can devolve into many small
+            # read-modify-write operations and drastically slow down wall time.
+            self.ovL = self.feri.create_dataset('ovL', ovL_shape, dtype=self.dtype)
             _init_mp_df_eris(self.with_df, self.orbocc, self.orbvir, self.max_memory,
                              ovL=self.ovL, log=log)
         elif isinstance(self._ovL, str):
