@@ -49,6 +49,9 @@ einsum = lib.einsum
 
 DEBUG_BLKSIZE = getattr(__config__, 'lno_base_klno_base_DEBUG_BLKSIZE', False)
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, '').strip().lower() in ('1', 'true', 'yes', 'on')
+
 
 class KLNO(LNO):
     r''' Base class for LNO-based methods with k-point mean-field reference.
@@ -109,6 +112,16 @@ class KLNO(LNO):
             nk = nkpts if is_isdf else (nkpts//2+nkpts%2 if gamma_point(self.kpts[0]) and np.isrealobj(orbocc) else nkpts)
             mem_df = nk*nocc*nvir*naux*dsize/1024**2.
             log.debug('ao2mo est mem= %.2f MB  avail mem= %.2f MB', mem_df, mem_now)
+
+            # Optional: fragment-wise / lazy ovL evaluation for ISDF-like backends.
+            # Avoids materializing full ovL (nocc*nvir*Naux_ibz) on disk.
+            if is_isdf and _env_flag('PYSCF_LNO_FRAGMENT_OVL'):
+                eris = _KLNODFLAZYERIS(self.with_df, orbocc, orbvir, self.max_memory,
+                                       verbose=self.verbose, stdout=self.stdout)
+                eris.build()
+                log.timer('Integral xform (lazy)', *cput0)
+                return eris
+
             if ( (self._ovL_to_save is not None) or (self._ovL is not None) or
                  self.force_outcore_ao2mo or (mem_df > mem_now*0.5) ):
                 eris = _KLNODFOUTCOREERIS(self.with_df, orbocc, orbvir, self.max_memory,
@@ -143,6 +156,138 @@ def _KLNODFOUTCOREERIS(with_df, orbocc, orbvir, max_memory, ovL=None, ovL_to_sav
     else:
         _ERIS = _KLNODFOUTCOREERIS_COMPLEX
     return _ERIS(with_df, orbocc, orbvir, max_memory, ovL, ovL_to_save, verbose, stdout)
+
+def _KLNODFLAZYERIS(with_df, orbocc, orbvir, max_memory, verbose=None, stdout=None):
+    """Lazy (on-the-fly) ovL evaluation to avoid storing full ovL.
+
+    Only implemented for Gamma-point real-orbital case.
+    """
+    if gamma_point(with_df.kpts[0]) and np.isrealobj(orbocc.dtype):
+        return _KLNODFLAZYERIS_REAL(with_df, orbocc, orbvir, max_memory, verbose, stdout)
+    raise NotImplementedError("Lazy ovL is only implemented for real orbitals (gamma-point) for now.")
+
+
+def _compute_ovL_real(k2sdf, mo1, mo2, max_memory, log=None):
+    """Compute ovL factors for (mo1, mo2) without storing full canonical ovL.
+
+    Returns (ovLR, ovLI) with shape (nmo1, nmo2, Naux_ibz).
+    """
+    if log is None:
+        log = logger.Logger(sys.stdout, 3)
+
+    kmo1 = k2sdf.s2k_mo_coeff(mo1)
+    kmo2 = k2sdf.s2k_mo_coeff(mo2)
+    naux_by_q = k2sdf.naux_by_q
+    naux = int(k2sdf.naux)
+    Naux = int(k2sdf.Naux_ibz)
+
+    nmo1 = int(kmo1[0].shape[1])
+    nmo2 = int(kmo2[0].shape[1])
+
+    REAL = np.float64
+    COMPLEX = np.complex128
+    dsize = 8
+
+    ovLR = np.empty((nmo1, nmo2, Naux), dtype=REAL)
+    ovLI = np.empty((nmo1, nmo2, Naux), dtype=REAL)
+
+    mem_avail = max_memory - lib.current_memory()[0]
+    nao = int(kmo1[0].shape[0])
+    # Heuristic copied from _init_mp_df_eris_real (but with nmo1/nmo2).
+    mem_auxblk = (nao**2 + nmo1*nmo2*3) * dsize / 1e6
+    aux_blksize = min(naux, max(1, int(np.floor(mem_avail * 0.7 / mem_auxblk))))
+    if DEBUG_BLKSIZE:
+        aux_blksize = max(1, naux // 2)
+
+    buf = np.empty(aux_blksize * nmo1 * nmo2, dtype=COMPLEX)
+    bufR = np.empty(aux_blksize * nmo1 * nmo2, dtype=REAL)
+    bufI = np.empty(aux_blksize * nmo1 * nmo2, dtype=REAL)
+
+    for qi, q in enumerate(k2sdf.ibz2bz):
+        nauxq = int(naux_by_q[q])
+        if nauxq < naux:
+            ovLR[:, :, naux*qi + nauxq : naux*(qi+1)] = 0.0
+            ovLI[:, :, naux*qi + nauxq : naux*(qi+1)] = 0.0
+        for p0, p1 in lib.prange(0, nauxq, aux_blksize):
+            auxslice = (p0, p1)
+            dp = int(p1 - p0)
+            LovR = np.ndarray((nmo1, nmo2, dp), dtype=REAL, buffer=bufR)
+            LovI = np.ndarray((nmo1, nmo2, dp), dtype=REAL, buffer=bufI)
+            LovR.fill(0.0)
+            LovI.fill(0.0)
+            for (_ki, _kj), LpqR, LpqI in k2sdf.loop_ao2mo(q, mo1, mo2, buf=buf,
+                                                          real_and_imag=True, auxslice=auxslice):
+                # LpqR/LpqI are returned in (dp,nmo1,nmo2) order.
+                LovR += LpqR.reshape(dp, nmo1, nmo2).transpose(1, 2, 0)
+                LovI += LpqI.reshape(dp, nmo1, nmo2).transpose(1, 2, 0)
+            w = k2sdf.qpts_ibz_weights[qi]
+            LovR *= w
+            LovI *= w
+            b0 = naux * qi + p0
+            b1 = b0 + dp
+            ovLR[:, :, b0:b1] = LovR
+            ovLI[:, :, b0:b1] = LovI
+
+    buf = bufR = bufI = None
+    return ovLR, ovLI
+
+
+class _KLNODFLAZYERIS_REAL(K2SDF):
+    """Lazy ERIS: compute ovL factors on demand.
+
+    Optimized for LNO types that predominantly use xform_occ/xform_vir (e.g. 2p/2h).
+    """
+    def __init__(self, with_df, orbocc, orbvir, max_memory, verbose=None, stdout=None):
+        K2SDF.__init__(self, with_df)
+        self.orbocc = orbocc
+        self.orbvir = orbvir
+        self.max_memory = max_memory
+        self.verbose = verbose
+        self.stdout = stdout
+
+        self.dtype = np.float64
+        self.dsize = 8
+        self.dtype_eri, self.dsize_eri = self.get_eri_dtype_dsize(orbocc, orbvir)
+
+    @property
+    def nocc(self):
+        return self.orbocc.shape[1]
+
+    @property
+    def nvir(self):
+        return self.orbvir.shape[1]
+
+    def build(self):
+        # No-op: computed on demand.
+        return self
+
+    def get_occ_blk(self, i0, i1):
+        # Slow fallback: occ slice vs full canonical vir.
+        log = logger.new_logger(self)
+        ovLR, ovLI = _compute_ovL_real(self, self.orbocc[:, i0:i1], self.orbvir, self.max_memory, log=log)
+        return np.asarray(ovLR, order='C'), np.asarray(ovLI, order='C')
+
+    def get_vir_blk(self, a0, a1, real_and_imag=False):
+        # Slow fallback: full canonical occ vs vir slice.
+        log = logger.new_logger(self)
+        ovLR, ovLI = _compute_ovL_real(self, self.orbocc, self.orbvir[:, a0:a1], self.max_memory, log=log)
+        if real_and_imag:
+            return np.asarray(ovLR, order='C'), np.asarray(ovLI, order='C')
+        return np.asarray(ovLR + 1j * ovLI, order='C')
+
+    def xform_occ(self, u):
+        # Compute factors for rotated occupied subspace directly: mo1 = orbocc @ u
+        log = logger.new_logger(self)
+        mo1 = np.dot(self.orbocc, u)
+        ovLR, ovLI = _compute_ovL_real(self, mo1, self.orbvir, self.max_memory, log=log)
+        return np.asarray(ovLR, order='C'), np.asarray(ovLI, order='C')
+
+    def xform_vir(self, u):
+        # Compute factors for rotated virtual subspace directly: mo2 = orbvir @ u
+        log = logger.new_logger(self)
+        mo2 = np.dot(self.orbvir, u)
+        ovLR, ovLI = _compute_ovL_real(self, self.orbocc, mo2, self.max_memory, log=log)
+        return np.asarray(ovLR, order='C'), np.asarray(ovLI, order='C')
 
 
 ''' DF ERI for real orbitals
