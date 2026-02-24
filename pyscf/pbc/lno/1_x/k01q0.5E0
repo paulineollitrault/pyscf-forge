@@ -1,0 +1,12 @@
+optimal exponential sum for 1/x of the form: polynomial + sum(n=1,...,k) omega[n]*exp(-alpha[n]*x), x varies in the interval [1,R]
+       1       0       0 	{number of exponential terms / polynomial degree / parameter}
+        5.0000000000   {R}
+ 2.0442531664663213598117502689532898330071 	{omega[1]}
+ 0.9630770221727580112768690723257236641075 	{alpha[1]}
+ 0.2015539740984434204638421628263955653892 	{beta[0]}
+ 1.092241969131668790607588015451 	{xi[1]}
+ 1.984271931788143006791975964109 	{xi[2]}
+ 4.233351913767988346747050965035 	{xi[3]}
+ 1.812080721E-02   {error} 0.000000000E+00 {Spanne}
+ 1.000000000E-07 value of smin [minimal xi-variation]
+1000         1 dr,new2 [number of subintervals per segment/Newton steps]
