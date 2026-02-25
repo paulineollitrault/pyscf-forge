@@ -142,6 +142,28 @@ class Water_REAL(unittest.TestCase):
         arr = make_lo_rdm1_vir_2h_real(eris, moeocc, moevir, uocc_loc)
         fp = lib.fp(arr)
         self.assertAlmostEqual(fp, -0.026564270182844, 7)
+
+        # --- New: projected-density APIs must match explicit projection ---
+        rng = np.random.default_rng(1)
+        nocc = orbocc.shape[1]
+        nvir = orbvir.shape[1]
+
+        nproj_occ = min(5, nocc)
+        X = rng.standard_normal((nocc, nproj_occ))
+        uproj_occ, _ = np.linalg.qr(X)  # (nocc,nproj_occ) orthonormal
+
+        dm_full = make_lo_rdm1_occ(eris, moeocc, moevir, uocc_loc, uvir_loc, '1h')
+        dm_ref = uproj_occ.T @ dm_full @ uproj_occ
+        dm_proj = make_lo_rdm1_occ_projected(eris, moeocc, moevir, uocc_loc, uvir_loc, '1h', uproj_occ)
+        self.assertLess(np.max(np.abs(dm_proj - dm_ref)), 1e-10)
+
+        nproj_vir = min(7, nvir)
+        Xv = rng.standard_normal((nvir, nproj_vir))
+        uproj_vir, _ = np.linalg.qr(Xv)
+        dm_full_v = make_lo_rdm1_vir(eris, moeocc, moevir, uocc_loc, uvir_loc, '1h')
+        dm_ref_v = uproj_vir.T @ dm_full_v @ uproj_vir
+        dm_proj_v = make_lo_rdm1_vir_projected(eris, moeocc, moevir, uocc_loc, uvir_loc, '1h', uproj_vir)
+        self.assertLess(np.max(np.abs(dm_proj_v - dm_ref_v)), 1e-10)
         
         
 class Water_COMPLEX(unittest.TestCase):
@@ -255,6 +277,28 @@ class Water_COMPLEX(unittest.TestCase):
         arr = make_lo_rdm1_vir_2h_complex(eris, moeocc, moevir, uocc_loc)
         fp = lib.fp(arr)
         self.assertAlmostEqual(fp, -0.002766848360192287-0.034349212190162834j, 7)
+
+        # --- New: projected-density APIs must match explicit projection (complex fallback path) ---
+        rng = np.random.default_rng(2)
+        nocc = orbocc.shape[1]
+        nvir = orbvir.shape[1]
+
+        nproj_occ = min(4, nocc)
+        X = rng.standard_normal((nocc, nproj_occ)) + 1j * rng.standard_normal((nocc, nproj_occ))
+        uproj_occ, _ = np.linalg.qr(X)  # unitary columns
+
+        dm_full = make_lo_rdm1_occ(eris, moeocc, moevir, uocc_loc, uvir_loc, '1h')
+        dm_ref = uproj_occ.conj().T @ dm_full @ uproj_occ
+        dm_proj = make_lo_rdm1_occ_projected(eris, moeocc, moevir, uocc_loc, uvir_loc, '1h', uproj_occ)
+        self.assertLess(np.max(np.abs(dm_proj - dm_ref)), 1e-10)
+
+        nproj_vir = min(6, nvir)
+        Xv = rng.standard_normal((nvir, nproj_vir)) + 1j * rng.standard_normal((nvir, nproj_vir))
+        uproj_vir, _ = np.linalg.qr(Xv)
+        dm_full_v = make_lo_rdm1_vir(eris, moeocc, moevir, uocc_loc, uvir_loc, '1h')
+        dm_ref_v = uproj_vir.conj().T @ dm_full_v @ uproj_vir
+        dm_proj_v = make_lo_rdm1_vir_projected(eris, moeocc, moevir, uocc_loc, uvir_loc, '1h', uproj_vir)
+        self.assertLess(np.max(np.abs(dm_proj_v - dm_ref_v)), 1e-10)
 
 
 

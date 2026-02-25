@@ -197,9 +197,18 @@ def make_las(mlno, eris, orbloc, lno_type, lno_param):
 
     ''' LNO construction
     '''
-    dmoo = mlno.make_lo_rdm1_occ(eris, moeocc, moevir, uocc_loc, uvir_loc, lno_type[0])
-    if mlno._match_oldcode: dmoo *= 0.5 # TO MATCH OLD LNO CODE
-    dmoo = reduce(np.dot, (uocc_orth.T.conj(), dmoo, uocc_orth))
+    # Prefer computing only the fragment-projected density needed for LNO selection:
+    #   d_orth = uocc_orth^H * dmoo * uocc_orth
+    # to avoid materializing the full (nocc,nocc) matrix for large systems.
+    if hasattr(mlno, "make_lo_rdm1_occ_projected"):
+        dmoo = mlno.make_lo_rdm1_occ_projected(
+            eris, moeocc, moevir, uocc_loc, uvir_loc, lno_type[0], uocc_orth
+        )
+    else:
+        dmoo = mlno.make_lo_rdm1_occ(eris, moeocc, moevir, uocc_loc, uvir_loc, lno_type[0])
+        dmoo = reduce(np.dot, (uocc_orth.T.conj(), dmoo, uocc_orth))
+    if mlno._match_oldcode:
+        dmoo *= 0.5  # TO MATCH OLD LNO CODE
     if lno_param[0]['norb'] is not None:
         lno_param[0]['norb'] -= uocc_loc.shape[1] + uocc_std.shape[1]
     uoccact_orth, uoccfrz_orth = natorb_select(dmoo, uocc_orth, **lno_param[0])
@@ -209,10 +218,16 @@ def make_las(mlno, eris, orbloc, lno_type, lno_param):
     uoccact_loc = np.linalg.multi_dot((orboccact.T.conj(), s1e, orbloc))
     cput1 = log.timer_debug1('make_lo_rdm1_occ', *cput1)
 
-    dmvv = mlno.make_lo_rdm1_vir(eris, moeocc, moevir, uocc_loc, uvir_loc, lno_type[1])
-    if mlno._match_oldcode: dmvv *= 0.5 # TO MATCH OLD LNO CODE
-    if uvir_orth is not None:
-        dmvv = reduce(np.dot, (uvir_orth.T.conj(), dmvv, uvir_orth))
+    if hasattr(mlno, "make_lo_rdm1_vir_projected") and uvir_orth is not None:
+        dmvv = mlno.make_lo_rdm1_vir_projected(
+            eris, moeocc, moevir, uocc_loc, uvir_loc, lno_type[1], uvir_orth
+        )
+    else:
+        dmvv = mlno.make_lo_rdm1_vir(eris, moeocc, moevir, uocc_loc, uvir_loc, lno_type[1])
+        if uvir_orth is not None:
+            dmvv = reduce(np.dot, (uvir_orth.T.conj(), dmvv, uvir_orth))
+    if mlno._match_oldcode:
+        dmvv *= 0.5  # TO MATCH OLD LNO CODE
         if lno_param[1]['norb'] is not None:
             lno_param[1]['norb'] -= uvir_loc.shape[1] + uvir_std.shape[1]
         uviract_orth, uvirfrz_orth = natorb_select(dmvv, uvir_orth, **lno_param[1])
@@ -540,6 +555,19 @@ class LNO(lib.StreamObject):
 
     def make_lo_rdm1_vir(self, eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type):
         return make_lo_rdm1_vir(eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type)
+
+    def make_lo_rdm1_occ_projected(self, eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type, uproj):
+        """Default projected occupied MP2 1RDM (fallback path).
+
+        Returns uproj^H dmoo uproj. Subclasses can override to avoid building full dmoo.
+        """
+        dmoo = self.make_lo_rdm1_occ(eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type)
+        return np.linalg.multi_dot((uproj.conj().T, dmoo, uproj))
+
+    def make_lo_rdm1_vir_projected(self, eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type, uproj):
+        """Default projected virtual MP2 1RDM (fallback path)."""
+        dmvv = self.make_lo_rdm1_vir(eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type)
+        return np.linalg.multi_dot((uproj.conj().T, dmvv, uproj))
 
     def _precompute(self, *args, **kwargs):
         pass

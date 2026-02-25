@@ -172,6 +172,13 @@ class GFMP2Result:
     e_corr_os: float
     meta: dict[str, Any]
 
+#
+# NOTE:
+# This module intentionally keeps only the validated GFMP2(OS) energy path
+# (kernel_os). Earlier experimental GF-based RDM construction and full MP2
+# (OS+SS) energy were removed to keep the implementation focused and avoid
+# accidental use in KLNO workflows.
+
 def _spectrum_range(mo_energy, mo_occ, *, occ_cutoff: float) -> tuple[float, float, float]:
     """Return (Emin, Emax, R=Emax/Emin) as defined in arXiv:2503.20482.
 
@@ -618,4 +625,8 @@ def kernel_os(
         },
     )
     return res
+
+
+#
+# NOTE: Full MP2 (OS+SS) energy and GF-based RDM/self-energy helpers were removed.
 

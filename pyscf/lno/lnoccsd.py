@@ -28,6 +28,7 @@
 
 
 import sys
+import os
 import numpy as np
 from functools import reduce
 
@@ -540,7 +541,11 @@ def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris,
             # MP2 fragment energy
             t1, t2 = mcc.init_amps(eris=imp_eris)[1:]
             cput1 = log.timer_debug1('imp sol - mp2 amp', *cput1)
-            elcorr_pt2 = get_fragment_energy(oovv, t2, uocc_loc).real
+            pt2_backend = os.environ.get("LNO_PT2_BACKEND", "fragment").strip().lower()
+            if pt2_backend in ("canonical", "kmp2", "kmp2_las"):
+                elcorr_pt2 = get_canonical_mp2_energy(oovv, t2).real
+            else:
+                elcorr_pt2 = get_fragment_energy(oovv, t2, uocc_loc).real
             cput1 = log.timer_debug1('imp sol - mp2 ene', *cput1)
 
             # CCSD fragment energy
@@ -603,6 +608,20 @@ def get_fragment_energy(oovv, t2, uocc_loc):
     ess = ed*0.5 + ex
     eos = ed*0.5
     return lib.tag_array(ess+eos, spin_comp=np.array((ess, eos)))
+
+
+def get_canonical_mp2_energy(oovv, t2):
+    """Canonical (unweighted) MP2 correlation energy and spin components in LAS.
+
+    This matches the usual RHF MP2 formula:
+      E = Σ_ijab t2_ijab (2 (ij|ab) - (ij|ba))
+    reported as spin components using the same convention as `get_fragment_energy`.
+    """
+    ed = (einsum("ijab,ijab->", t2, oovv) * 2).real
+    ex = (-einsum("ijab,ijba->", t2, oovv)).real
+    ess = ed * 0.5 + ex
+    eos = ed * 0.5
+    return lib.tag_array(ess + eos, spin_comp=np.array((ess, eos)))
 
 
 

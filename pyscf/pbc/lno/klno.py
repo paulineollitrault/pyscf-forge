@@ -43,7 +43,12 @@ from pyscf import __config__
 
 from pyscf.lno import LNO
 from pyscf.pbc.lno.tools import K2SDF, k2s_scf
-from pyscf.pbc.lno.make_lno_rdm1 import make_lo_rdm1_occ, make_lo_rdm1_vir
+from pyscf.pbc.lno.make_lno_rdm1 import (
+    make_lo_rdm1_occ,
+    make_lo_rdm1_vir,
+    make_lo_rdm1_occ_projected,
+    make_lo_rdm1_vir_projected,
+)
 
 einsum = lib.einsum
 
@@ -140,6 +145,13 @@ class KLNO(LNO):
 
     def make_lo_rdm1_vir(self, eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type):
         return make_lo_rdm1_vir(eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type)
+
+    def make_lo_rdm1_occ_projected(self, eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type, uproj):
+        """Projected occupied-space MP2 1RDM in the KLNO (supercell) basis."""
+        return make_lo_rdm1_occ_projected(eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type, uproj)
+
+    def make_lo_rdm1_vir_projected(self, eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type, uproj):
+        return make_lo_rdm1_vir_projected(eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type, uproj)
 
 
 def _KLNODFINCOREERIS(with_df, orbocc, orbvir, max_memory, verbose=None, stdout=None):

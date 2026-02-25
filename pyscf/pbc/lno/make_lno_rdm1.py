@@ -90,6 +90,45 @@ def make_lo_rdm1_vir(eris, moeocc, moevir, uocc, uvir, dm_type):
     dm = _check_dm_imag(eris, dm)
     return dm
 
+def make_lo_rdm1_occ_projected(eris, moeocc, moevir, uocc, uvir, dm_type, uproj):
+    """Projected occupied-space MP2 1RDM.
+
+    Returns uproj^H * dmoo * uproj without forming full dmoo when possible.
+
+    Args:
+        uproj: (nocc, nproj) projection matrix in occupied canonical MO basis.
+    """
+    if uproj is None:
+        return make_lo_rdm1_occ(eris, moeocc, moevir, uocc, uvir, dm_type)
+    isreal = eris.dtype == np.float64
+    dm_type = str(dm_type)
+    if isreal and dm_type == '1h':
+        dm = make_lo_rdm1_occ_1h_real_projected(eris, moeocc, moevir, uocc, uproj)
+    else:
+        # Fallback: build full then project (correct but may be expensive).
+        dmoo = make_lo_rdm1_occ(eris, moeocc, moevir, uocc, uvir, dm_type)
+        dm = np.linalg.multi_dot((uproj.conj().T, dmoo, uproj))
+    dm = _check_dm_imag(eris, dm)
+    return dm
+
+def make_lo_rdm1_vir_projected(eris, moeocc, moevir, uocc, uvir, dm_type, uproj):
+    """Projected virtual-space MP2 1RDM.
+
+    Returns uproj^H * dmvv * uproj (fallback builds full dmvv).
+    """
+    if uproj is None:
+        return make_lo_rdm1_vir(eris, moeocc, moevir, uocc, uvir, dm_type)
+    dm_type = str(dm_type)
+    isreal = eris.dtype == np.float64
+    if isreal and dm_type == '1h':
+        dm = make_lo_rdm1_vir_1h_real_projected(eris, moeocc, moevir, uocc, uproj)
+    else:
+        # Fallback: build full then project (correct but may be expensive).
+        dmvv = make_lo_rdm1_vir(eris, moeocc, moevir, uocc, uvir, dm_type)
+        dm = np.linalg.multi_dot((uproj.conj().T, dmvv, uproj))
+    dm = _check_dm_imag(eris, dm)
+    return dm
+
 ''' make lo rdm1 for real orbitals
 '''
 def make_full_rdm1(eris, moeocc, moevir, with_occ=True, with_vir=True):
@@ -232,6 +271,86 @@ def make_lo_rdm1_occ_1h_real(eris, moeocc, moevir, u):
     buf1 = buf2 = None
 
     return dm
+
+def make_lo_rdm1_occ_1h_real_projected(eris, moeocc, moevir, u, uproj):
+    """Projected version of make_lo_rdm1_occ_1h_real.
+
+    Computes dm_proj = uproj^T * dm * uproj without forming full dm.
+    """
+    nocc, nvir, naux = eris.nocc, eris.nvir, eris.Naux_ibz
+    REAL = np.float64
+    dsize = 8
+    assert u.dtype == REAL
+    assert uproj.dtype == REAL
+    nOcc = u.shape[1]
+    nProj = uproj.shape[1]
+
+    mem_avail = eris.max_memory - lib.current_memory()[0]
+    M = mem_avail * 0.7 * 1e6 / dsize
+    occblksize, mem_peak = _mp2_rdm1_occblksize(nocc, nvir, naux, 4, 3, M, dsize)
+    if DEBUG_BLKSIZE:
+        occblksize = max(1, nocc // 2)
+    logger.debug1(
+        eris,
+        'make_lo_rdm1_occ_1h_real_projected: nocc=%d nvir=%d nOcc=%d naux=%d occblksize=%d peak mem=%.2f MB nProj=%d',
+        nocc, nvir, nOcc, naux, occblksize, mem_peak, nProj,
+    )
+    bufsize = occblksize * min(occblksize, nOcc) * nvir**2
+    buf1 = np.empty(bufsize, dtype=REAL)
+    buf2 = np.empty(bufsize, dtype=REAL)
+
+    moeOcc, u = subspace_eigh(np.diag(moeocc), u)
+    eov = moeocc[:, None] - moevir
+    eOv = moeOcc[:, None] - moevir
+
+    dm_proj = np.zeros((nProj, nProj), dtype=REAL)
+    for _Kbatch, (K0, K1) in enumerate(lib.prange(0, nOcc, occblksize)):
+        KvLR, KvLI = eris.xform_occ(u[:, K0:K1])
+        KvLR = KvLR.reshape(-1, naux)
+        KvLI = KvLI.reshape(-1, naux)
+        eKv = eOv[K0:K1]
+        for _ibatch, (i0, i1) in enumerate(lib.prange(0, nocc, occblksize)):
+            eiv = eov[i0:i1]
+            eivKv = lib.direct_sum('ia+Kb->iaKb', eiv, eKv)
+            ivLR, ivLI = eris.get_occ_blk(i0, i1)
+            ivLR = ivLR.reshape(-1, naux)
+            ivLI = ivLI.reshape(-1, naux)
+            t2ivKv = np.ndarray((ivLR.shape[0], KvLR.shape[0]), dtype=REAL, buffer=buf1)
+            _dot_ovlp(eris, ivLR, ivLI, KvLR.T, KvLI.T, t2ivKv)
+            t2ivKv = t2ivKv.reshape(*eivKv.shape)
+            t2ivKv /= eivKv
+            ivLR = ivLI = None
+            eivKv = None
+            Ui = uproj[i0:i1]  # (i_blk, nProj)
+            for _jbatch, (j0, j1) in enumerate(lib.prange(0, nocc, occblksize)):
+                if j0 == i0 and j1 == i1:
+                    t2jvKv = t2ivKv
+                else:
+                    ejv = eov[j0:j1]
+                    ejvKv = lib.direct_sum('ia+Kb->iaKb', ejv, eKv)
+                    jvLR, jvLI = eris.get_occ_blk(j0, j1)
+                    jvLR = jvLR.reshape(-1, naux)
+                    jvLI = jvLI.reshape(-1, naux)
+                    t2jvKv = np.ndarray((jvLR.shape[0], KvLR.shape[0]), dtype=REAL, buffer=buf2)
+                    _dot_ovlp(eris, jvLR, jvLI, KvLR.T, KvLI.T, t2jvKv)
+                    t2jvKv = t2jvKv.reshape(*ejvKv.shape)
+                    t2jvKv /= ejvKv
+                    jvLR = jvLI = None
+                    ejvKv = None
+                dm_block = np.empty((i1 - i0, j1 - j0), dtype=REAL)
+                dm_block[:] = 0.0
+                dm_block -= 4 * lib.einsum('iaKb,jaKb->ij', t2ivKv, t2jvKv)
+                dm_block += 2 * lib.einsum('iaKb,jbKa->ij', t2ivKv, t2jvKv)
+                Uj = uproj[j0:j1]
+                dm_proj += Ui.T.dot(dm_block).dot(Uj)
+                dm_block = None
+                if not (j0 == i0 and j1 == i1):
+                    t2jvKv = None
+            t2ivKv = None
+        KvLR = KvLI = None
+
+    buf1 = buf2 = None
+    return dm_proj
 
 def make_lo_rdm1_occ_1p_real(eris, moeocc, moevir, u):
     r''' Occupied MP2 density matrix with one localized particle
@@ -513,6 +632,84 @@ def make_lo_rdm1_vir_1h_real(eris, moeocc, moevir, u):
     buf = None
 
     return dm
+
+def make_lo_rdm1_vir_1h_real_projected(eris, moeocc, moevir, u, uproj):
+    """Projected version of make_lo_rdm1_vir_1h_real.
+
+    Computes dm_proj = uproj^H * dm * uproj without forming full dm.
+    """
+    nocc, nvir, naux = eris.nocc, eris.nvir, eris.Naux_ibz
+    REAL = np.float64
+    dsize = 8
+    assert u.dtype == REAL
+    assert uproj.dtype == REAL
+    nOcc = u.shape[1]
+    nProj = uproj.shape[1]
+
+    # determine Occblksize
+    mem_avail = eris.max_memory - lib.current_memory()[0]
+    M = mem_avail * 0.7 * 1e6 / dsize
+    occblksize, mem_peak = _mp2_rdm1_occblksize(nocc, nvir, naux, 4, 3, M, dsize)
+    if DEBUG_BLKSIZE:
+        occblksize = max(1, nocc // 2)
+    logger.debug1(
+        eris,
+        'make_lo_rdm1_vir_1h_real_projected: nocc=%d nvir=%d nOcc=%d naux=%d occblksize=%d peak mem=%.2f MB nProj=%d',
+        nocc, nvir, nOcc, naux, occblksize, mem_peak, nProj,
+    )
+    bufsize = nocc * min(nocc, occblksize) * nvir**2
+    buf = np.empty(bufsize, dtype=REAL)
+
+    moeOcc, u = subspace_eigh(np.diag(moeocc), u)
+    eOv = moeOcc[:, None] - moevir
+    eov = moeocc[:, None] - moevir
+
+    dm_proj = np.zeros((nProj, nProj), dtype=REAL)
+    for _Ibatch, (I0, I1) in enumerate(lib.prange(0, nOcc, occblksize)):
+        IvLR, IvLI = eris.xform_occ(u[:, I0:I1])
+        IvLR = IvLR.reshape(-1, naux)
+        IvLI = IvLI.reshape(-1, naux)
+        eIv = eOv[I0:I1]
+        for _jbatch, (j0, j1) in enumerate(lib.prange(0, nocc, occblksize)):
+            ejv = eov[j0:j1]
+            eIvjv = lib.direct_sum('Ia+jb->Iajb', eIv, ejv)
+            jvLR, jvLI = eris.get_occ_blk(j0, j1)
+            jvLR = jvLR.reshape(-1, naux)
+            jvLI = jvLI.reshape(-1, naux)
+            t2 = np.ndarray((IvLR.shape[0], jvLR.shape[0]), dtype=REAL, buffer=buf)
+            _dot_ovlp(eris, IvLR, IvLI, jvLR.T, jvLI.T, t2)
+            t2 = t2.reshape(*eIvjv.shape)  # (I,a,j,b)
+            t2 /= eIvjv
+            eIvjv = None
+            jvLR = jvLI = None
+
+            # Project external virtual indices using the same index pattern as
+            # make_lo_rdm1_vir_1h_real (no implicit transpose of t2).
+            #
+            # t2 has indices (I,a,j,c) where `a` is the first virtual index and `c`
+            # is the second virtual index.
+            #
+            # Build both projections needed:
+            #   t1[I,A,j,c] = Σ_a t2[I,a,j,c] * P[a,A]   (project axis-1)
+            #   t3[I,a,j,A] = Σ_c t2[I,a,j,c] * P[c,A]   (project axis-3)
+            t1 = lib.einsum('Iajc,aA->IAjc', t2, uproj)   # (I,A,j,c)
+            t3 = lib.einsum('Iajc,cA->IajA', t2, uproj)   # (I,a,j,A)  (interpret a as c below)
+
+            # dm += 2 * einsum('Iajc,Ibjc->ab', t2, t2)
+            dm_proj += 2 * lib.einsum('IAjc,IBjc->AB', t1, t1)
+            # dm -= einsum('Iajc,Icjb->ab', t2, t2)
+            dm_proj -= lib.einsum('IAjc,IcjB->AB', t1, t3)
+            # dm -= einsum('Icja,Ibjc->ab', t2, t2)
+            dm_proj -= lib.einsum('IcjA,IBjc->AB', t3, t1)
+            # dm += 2 * einsum('Icja,Icjb->ab', t2, t2)
+            dm_proj += 2 * lib.einsum('IcjA,IcjB->AB', t3, t3)
+
+            t2 = t1 = t3 = None
+
+        IvLR = IvLI = None
+    buf = None
+
+    return dm_proj
 
 def make_lo_rdm1_vir_2h_real(eris, moeocc, moevir, u):
     r''' Occupied MP2 density matrix with two localized holes

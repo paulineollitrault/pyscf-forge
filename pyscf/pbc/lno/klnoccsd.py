@@ -87,6 +87,12 @@ def K2SCCSD(mf, with_df, frozen, mo_coeff, mo_occ):
     naux = k2sdf.Naux_ibz
     is_isdf = (not hasattr(with_df, '_cderi')) and hasattr(with_df, 'coul_kpt')
     maskocc = mo_occ > 1e-10
+    # Gamma-point path expects real orbitals. If mo_coeff is complex with only
+    # negligible numerical imaginary noise, safely drop the imaginary part.
+    if gamma_point(with_df.kpts[0]) and np.iscomplexobj(mo_coeff):
+        imax = float(np.max(np.abs(np.asarray(mo_coeff).imag)))
+        if imax < 1e-4:
+            mo_coeff = np.asarray(np.asarray(mo_coeff).real, order="C")
     frozen, maskact = get_maskact(frozen, len(mo_occ))
     nvir = np.count_nonzero(~maskocc & maskact)
     nvir_pair = nvir*(nvir+1)//2
