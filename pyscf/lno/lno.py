@@ -228,6 +228,12 @@ def make_las(mlno, eris, orbloc, lno_type, lno_param):
             dmvv = reduce(np.dot, (uvir_orth.T.conj(), dmvv, uvir_orth))
     if mlno._match_oldcode:
         dmvv *= 0.5  # TO MATCH OLD LNO CODE
+    if uvir_orth is not None:
+        # dmvv is in the uvir_orth subspace whenever uvir_orth is not None:
+        # - projected fast-path returns uvir_orth^H * dmvv * uvir_orth
+        # - fallback explicitly applies the same projection
+        #
+        # Therefore, LNO selection must be done in the uvir_orth basis.
         if lno_param[1]['norb'] is not None:
             lno_param[1]['norb'] -= uvir_loc.shape[1] + uvir_std.shape[1]
         uviract_orth, uvirfrz_orth = natorb_select(dmvv, uvir_orth, **lno_param[1])

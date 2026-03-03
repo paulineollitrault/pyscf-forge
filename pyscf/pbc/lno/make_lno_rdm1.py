@@ -104,6 +104,8 @@ def make_lo_rdm1_occ_projected(eris, moeocc, moevir, uocc, uvir, dm_type, uproj)
     dm_type = str(dm_type)
     if isreal and dm_type == '1h':
         dm = make_lo_rdm1_occ_1h_real_projected(eris, moeocc, moevir, uocc, uproj)
+    elif isreal and dm_type == '2p':
+        dm = make_lo_rdm1_occ_2p_real_projected(eris, moeocc, moevir, uvir, uproj)
     else:
         # Fallback: build full then project (correct but may be expensive).
         dmoo = make_lo_rdm1_occ(eris, moeocc, moevir, uocc, uvir, dm_type)
@@ -122,6 +124,8 @@ def make_lo_rdm1_vir_projected(eris, moeocc, moevir, uocc, uvir, dm_type, uproj)
     isreal = eris.dtype == np.float64
     if isreal and dm_type == '1h':
         dm = make_lo_rdm1_vir_1h_real_projected(eris, moeocc, moevir, uocc, uproj)
+    elif isreal and dm_type == '2h':
+        dm = make_lo_rdm1_vir_2h_real_projected(eris, moeocc, moevir, uocc, uproj)
     else:
         # Fallback: build full then project (correct but may be expensive).
         dmvv = make_lo_rdm1_vir(eris, moeocc, moevir, uocc, uvir, dm_type)
@@ -285,71 +289,91 @@ def make_lo_rdm1_occ_1h_real_projected(eris, moeocc, moevir, u, uproj):
     nOcc = u.shape[1]
     nProj = uproj.shape[1]
 
-    mem_avail = eris.max_memory - lib.current_memory()[0]
-    M = mem_avail * 0.7 * 1e6 / dsize
+    mem_avail_mb = eris.max_memory - lib.current_memory()[0]
+    # Keep the same heuristic for i-blocking as the full kernel.
+    M = max(0.0, float(mem_avail_mb)) * 0.7 * 1e6 / dsize
     occblksize, mem_peak = _mp2_rdm1_occblksize(nocc, nvir, naux, 4, 3, M, dsize)
     if DEBUG_BLKSIZE:
         occblksize = max(1, nocc // 2)
+
+    # K-blocking for the projected algorithm should avoid large persistent
+    # allocations because RSS is used in later blocksize heuristics.
+    # Limit the accumulator size to ~256MB (or smaller if max_memory is tiny).
+    bytes_per_K_acc = float(dsize) * float(nProj) * float(nvir) * float(nvir)
+    mem_bytes = max(0.0, float(mem_avail_mb)) * 1e6
+    target_bytes = min(256e6, 0.25 * mem_bytes) if mem_bytes > 0 else 64e6
+    Kblksize = 1
+    if bytes_per_K_acc > 0 and target_bytes > 0:
+        Kblksize = max(1, int(target_bytes / bytes_per_K_acc))
+    Kblksize = max(1, min(int(nOcc), int(Kblksize), 4))  # hard cap for safety
+
     logger.debug1(
         eris,
-        'make_lo_rdm1_occ_1h_real_projected: nocc=%d nvir=%d nOcc=%d naux=%d occblksize=%d peak mem=%.2f MB nProj=%d',
-        nocc, nvir, nOcc, naux, occblksize, mem_peak, nProj,
+        'make_lo_rdm1_occ_1h_real_projected: nocc=%d nvir=%d nOcc=%d naux=%d occblksize=%d Kblksize=%d peak mem=%.2f MB nProj=%d',
+        nocc, nvir, nOcc, naux, occblksize, Kblksize, mem_peak, nProj,
     )
-    bufsize = occblksize * min(occblksize, nOcc) * nvir**2
-    buf1 = np.empty(bufsize, dtype=REAL)
-    buf2 = np.empty(bufsize, dtype=REAL)
+
+    # Single work buffer for t2(i,a,K,b) in 2D form (i*a, K*b).
+    bufsize = max(1, int(occblksize) * int(Kblksize) * int(nvir) * int(nvir))
+    buf = np.empty(bufsize, dtype=REAL)
 
     moeOcc, u = subspace_eigh(np.diag(moeocc), u)
     eov = moeocc[:, None] - moevir
     eOv = moeOcc[:, None] - moevir
 
     dm_proj = np.zeros((nProj, nProj), dtype=REAL)
-    for _Kbatch, (K0, K1) in enumerate(lib.prange(0, nOcc, occblksize)):
+    for _Kbatch, (K0, K1) in enumerate(lib.prange(0, nOcc, Kblksize)):
+        Kblk = K1 - K0
         KvLR, KvLI = eris.xform_occ(u[:, K0:K1])
         KvLR = KvLR.reshape(-1, naux)
         KvLI = KvLI.reshape(-1, naux)
         eKv = eOv[K0:K1]
+
+        # Accumulate projected amplitudes for this K-block:
+        #   A[p,k,a,b] = Σ_i uproj[i,p] * t2[i,a,k,b]
+        A = np.zeros((nProj, Kblk, nvir, nvir), dtype=REAL)
+
         for _ibatch, (i0, i1) in enumerate(lib.prange(0, nocc, occblksize)):
+            i_blk = i1 - i0
+            Ui = uproj[i0:i1]  # (i_blk, nProj)
+
             eiv = eov[i0:i1]
             eivKv = lib.direct_sum('ia+Kb->iaKb', eiv, eKv)
             ivLR, ivLI = eris.get_occ_blk(i0, i1)
             ivLR = ivLR.reshape(-1, naux)
             ivLI = ivLI.reshape(-1, naux)
-            t2ivKv = np.ndarray((ivLR.shape[0], KvLR.shape[0]), dtype=REAL, buffer=buf1)
-            _dot_ovlp(eris, ivLR, ivLI, KvLR.T, KvLI.T, t2ivKv)
-            t2ivKv = t2ivKv.reshape(*eivKv.shape)
-            t2ivKv /= eivKv
+
+            t2 = np.ndarray((ivLR.shape[0], KvLR.shape[0]), dtype=REAL, buffer=buf)
+            _dot_ovlp(eris, ivLR, ivLI, KvLR.T, KvLI.T, t2)
+            t2 = t2.reshape(*eivKv.shape)  # (i,a,K,b)
+            t2 /= eivKv
             ivLR = ivLI = None
             eivKv = None
-            Ui = uproj[i0:i1]  # (i_blk, nProj)
-            for _jbatch, (j0, j1) in enumerate(lib.prange(0, nocc, occblksize)):
-                if j0 == i0 and j1 == i1:
-                    t2jvKv = t2ivKv
-                else:
-                    ejv = eov[j0:j1]
-                    ejvKv = lib.direct_sum('ia+Kb->iaKb', ejv, eKv)
-                    jvLR, jvLI = eris.get_occ_blk(j0, j1)
-                    jvLR = jvLR.reshape(-1, naux)
-                    jvLI = jvLI.reshape(-1, naux)
-                    t2jvKv = np.ndarray((jvLR.shape[0], KvLR.shape[0]), dtype=REAL, buffer=buf2)
-                    _dot_ovlp(eris, jvLR, jvLI, KvLR.T, KvLI.T, t2jvKv)
-                    t2jvKv = t2jvKv.reshape(*ejvKv.shape)
-                    t2jvKv /= ejvKv
-                    jvLR = jvLI = None
-                    ejvKv = None
-                dm_block = np.empty((i1 - i0, j1 - j0), dtype=REAL)
-                dm_block[:] = 0.0
-                dm_block -= 4 * lib.einsum('iaKb,jaKb->ij', t2ivKv, t2jvKv)
-                dm_block += 2 * lib.einsum('iaKb,jbKa->ij', t2ivKv, t2jvKv)
-                Uj = uproj[j0:j1]
-                dm_proj += Ui.T.dot(dm_block).dot(Uj)
-                dm_block = None
-                if not (j0 == i0 and j1 == i1):
-                    t2jvKv = None
-            t2ivKv = None
+
+            # Project occupied index i -> p for all K in this block at once.
+            #
+            # Reshape t2 to (i_blk, Kblk*nvir*nvir) then a single GEMM:
+            #   Ak[p, (k,a,b)] = Σ_i Ui[i,p] * t2[i, (k,a,b)]
+            #
+            # This reduces the number of GEMMs (and Python overhead) by ~Kblk.
+            t2r = t2.reshape(i_blk, -1)
+            Ak = Ui.T.dot(t2r)  # (nProj, Kblk*nvir*nvir)
+            A += Ak.reshape(nProj, Kblk, nvir, nvir)
+            t2r = Ak = None
+
+            t2 = None
+
+        # Contract projected amplitudes to build dm_proj for this K-block.
+        for k in range(Kblk):
+            Ak = A[:, k, :, :].reshape(nProj, -1)
+            AkT = A[:, k, :, :].transpose(0, 2, 1).reshape(nProj, -1)
+            dm_proj -= 4.0 * Ak.dot(Ak.T)
+            dm_proj += 2.0 * Ak.dot(AkT.T)
+
+        A = None
         KvLR = KvLI = None
 
-    buf1 = buf2 = None
+    buf = None
     return dm_proj
 
 def make_lo_rdm1_occ_1p_real(eris, moeocc, moevir, u):
@@ -485,6 +509,88 @@ def make_lo_rdm1_occ_2p_real(eris, moeocc, moevir, u):
     buf = None
 
     return dm
+
+
+def make_lo_rdm1_occ_2p_real_projected(eris, moeocc, moevir, u, uproj):
+    r'''Projected version of make_lo_rdm1_occ_2p_real.
+
+    Computes dm_proj = uproj^T * dm * uproj without forming full dm.
+
+    Args:
+        u: (nvir, nVir) overlap between canonical and localized virtual orbitals.
+        uproj: (nocc, nProj) projection matrix in occupied canonical MO basis.
+    '''
+    nocc, nvir, naux = eris.nocc, eris.nvir, eris.Naux_ibz
+    REAL = np.float64
+    dsize = 8
+    assert u.dtype == REAL
+    assert uproj.dtype == REAL
+    nVir = u.shape[1]
+    nProj = uproj.shape[1]
+
+    # determine Virblksize (same model as full dm builder)
+    mem_avail = eris.max_memory - lib.current_memory()[0]
+    M = mem_avail * 0.7 * 1e6 / dsize
+    Virblksize, mem_peak = _mp2_rdm1_virblksize(nocc, nVir, naux, 4, 3, M, dsize)
+    if DEBUG_BLKSIZE:
+        Virblksize = max(1, nVir // 2)
+    logger.debug1(
+        eris,
+        'make_lo_rdm1_occ_2p_real_projected: nocc=%d nvir=%d nVir=%d naux=%d Virblksize=%d peak mem=%.2f MB nProj=%d',
+        nocc, nvir, nVir, naux, Virblksize, mem_peak, nProj,
+    )
+
+    bufsize = (Virblksize * nocc) ** 2
+    buf = np.empty(bufsize, dtype=REAL)
+
+    moeVir, u = subspace_eigh(np.diag(moevir), u)
+    eoV = moeocc[:, None] - moeVir  # (nocc, nVir)
+
+    dm_proj = np.zeros((nProj, nProj), dtype=REAL)
+    for Abatch, (A0, A1) in enumerate(lib.prange(0, nVir, Virblksize)):
+        oALR, oALI = eris.xform_vir(u[:, A0:A1])
+        oALR = oALR.reshape(-1, naux)
+        oALI = oALI.reshape(-1, naux)
+        eoA = eoV[:, A0:A1]
+        Ablk = A1 - A0
+
+        for Bbatch, (B0, B1) in enumerate(lib.prange(0, nVir, Virblksize)):
+            if Bbatch == Abatch:
+                eoB = eoA
+                oBLR = oALR
+                oBLI = oALI
+            else:
+                eoB = eoV[:, B0:B1]
+                oBLR, oBLI = eris.xform_vir(u[:, B0:B1])
+                oBLR = oBLR.reshape(-1, naux)
+                oBLI = oBLI.reshape(-1, naux)
+
+            Bblk = B1 - B0
+
+            eoAoB = lib.direct_sum('iA+jB->iAjB', eoA, eoB)
+            t2 = np.ndarray((oALR.shape[0], oBLR.shape[0]), dtype=REAL, buffer=buf)
+            _dot_ovlp(eris, oALR, oALI, oBLR.T, oBLI.T, t2)
+            t2 = t2.reshape(nocc, Ablk, nocc, Bblk)  # (i,A,k,B)
+            t2 /= eoAoB
+            eoAoB = None
+            oBLR = oBLI = None
+
+            # Left[p,A,k,B]  = Σ_i uproj[i,p] * t2[i,A,k,B]
+            left = lib.einsum('ip,iAkB->pAkB', uproj, t2)
+            # Right[k,A,q,B] = Σ_j t2[k,A,j,B] * uproj[j,q]
+            right = lib.einsum('kAjB,jq->kAqB', t2, uproj)
+
+            # dm_proj -= 4 * Σ_{A,k,B} left[p,A,k,B] * left[q,A,k,B]
+            dm_proj -= 4.0 * lib.einsum('pAkB,qAkB->pq', left, left)
+            # dm_proj += 2 * Σ_{A,k,B} left[p,A,k,B] * right[k,A,q,B]
+            dm_proj += 2.0 * lib.einsum('pAkB,kAqB->pq', left, right)
+
+            t2 = left = right = None
+
+        oALR = oALI = None
+
+    buf = None
+    return dm_proj
 
 def make_lo_rdm1_vir_1p_real(eris, moeocc, moevir, u):
     r''' Virtual MP2 density matrix with one localized particle
@@ -778,6 +884,89 @@ def make_lo_rdm1_vir_2h_real(eris, moeocc, moevir, u):
     buf = None
 
     return dm
+
+
+def make_lo_rdm1_vir_2h_real_projected(eris, moeocc, moevir, u, uproj):
+    r'''Projected version of make_lo_rdm1_vir_2h_real.
+
+    Computes dm_proj = uproj^T * dm * uproj without forming full dm.
+
+    Args:
+        u: (nocc, nOcc) overlap between canonical and localized occupied orbitals.
+        uproj: (nvir, nProj) projection matrix in virtual canonical MO basis.
+    '''
+    nocc, nvir, naux = eris.nocc, eris.nvir, eris.Naux_ibz
+    REAL = np.float64
+    dsize = 8
+    assert u.dtype == REAL
+    assert uproj.dtype == REAL
+    nOcc = u.shape[1]
+    nProj = uproj.shape[1]
+
+    # determine Occblksize (same model as full dm builder)
+    mem_avail = eris.max_memory - lib.current_memory()[0]
+    M = mem_avail * 0.7 * 1e6 / dsize
+    Occblksize, mem_peak = _mp2_rdm1_occblksize(nOcc, nvir, naux, 4, 3, M, dsize)
+    if DEBUG_BLKSIZE:
+        Occblksize = max(1, nOcc // 2)
+    logger.debug1(
+        eris,
+        'make_lo_rdm1_vir_2h_real_projected: nocc=%d nvir=%d nOcc=%d naux=%d Occblksize=%d peak mem=%.2f MB nProj=%d',
+        nocc, nvir, nOcc, naux, Occblksize, mem_peak, nProj,
+    )
+
+    bufsize = (Occblksize * nvir) ** 2
+    buf = np.empty(bufsize, dtype=REAL)
+
+    moeOcc, u = subspace_eigh(np.diag(moeocc), u)
+    eOv = moeOcc[:, None] - moevir  # (nOcc, nvir)
+
+    dm_proj = np.zeros((nProj, nProj), dtype=REAL)
+    for Ibatch, (I0, I1) in enumerate(lib.prange(0, nOcc, Occblksize)):
+        IvLR, IvLI = eris.xform_occ(u[:, I0:I1])
+        IvLR = IvLR.reshape(-1, naux)
+        IvLI = IvLI.reshape(-1, naux)
+        eIv = eOv[I0:I1]
+        Iblk = I1 - I0
+
+        for Jbatch, (J0, J1) in enumerate(lib.prange(0, nOcc, Occblksize)):
+            if Jbatch == Ibatch:
+                eJv = eIv
+                JvLR = IvLR
+                JvLI = IvLI
+            else:
+                eJv = eOv[J0:J1]
+                JvLR, JvLI = eris.xform_occ(u[:, J0:J1])
+                JvLR = JvLR.reshape(-1, naux)
+                JvLI = JvLI.reshape(-1, naux)
+
+            Jblk = J1 - J0
+
+            eIvJv = lib.direct_sum('Ia+Jb->IaJb', eIv, eJv)
+            t2 = np.ndarray((IvLR.shape[0], JvLR.shape[0]), dtype=REAL, buffer=buf)
+            _dot_ovlp(eris, IvLR, IvLI, JvLR.T, JvLI.T, t2)
+            t2 = t2.reshape(Iblk, nvir, Jblk, nvir)  # (I,a,J,b)
+            t2 /= eIvJv
+            eIvJv = None
+            JvLR = JvLI = None
+
+            # Project both virtual indices using uproj:
+            # tA[I,A,J,b] = Σ_a t2[I,a,J,b] * P[a,A]
+            tA = lib.einsum('IaJb,aA->IAJb', t2, uproj)
+            # tB[I,a,J,B] = Σ_b t2[I,a,J,b] * P[b,B]
+            tB = lib.einsum('IaJb,bB->IaJB', t2, uproj)
+
+            # dm_proj += 4 * einsum('IAJc,IBJc->AB', tA, tA)
+            dm_proj += 4.0 * lib.einsum('IAJc,IBJc->AB', tA, tA)
+            # dm_proj -= 2 * einsum('IAJc,IcJB->AB', tA, tB)
+            dm_proj -= 2.0 * lib.einsum('IAJc,IcJB->AB', tA, tB)
+
+            t2 = tA = tB = None
+
+        IvLR = IvLI = None
+
+    buf = None
+    return dm_proj
 
 
 ''' make lo rdm1 for complex orbitals
